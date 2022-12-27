@@ -4,6 +4,9 @@ require 'fileutils'
 require 'socket'
 require 'time'
 
+# TODO: Remove unnecessary logging.
+# Actually load and sync to configs using YAML.
+
 class TimeoutPrioQueue
   class Elem
     attr_reader :expiration, :ft
@@ -13,8 +16,8 @@ class TimeoutPrioQueue
       @ft = ft
     end
 
-    def <=>(other)
-      return @expiration <=> other
+    def needs_commit?
+      return !@ft.expiration.nil? && @ft.expiration <= @expiration
     end
   end
 
@@ -24,81 +27,138 @@ class TimeoutPrioQueue
 
   def <<(ft)
     elem = Elem.new ft
-    idx = @elements.bsearch_index { |e| e.expiration > elem } ||
+    idx = @elements.bsearch_index { |e| e.expiration > elem.expiration } ||
       @elements.length
     @elements.insert(idx, elem)
   end
 
   def seconds_to_next
     if @elements.length > 0
-      return [(@elements[0].expiration - Time.now + 0.5).to_i, 0].max
+      # XXX: Add an extra second to avoid repeated 0 second timeouts
+      # when close to expiration.
+      return [(@elements[0].expiration - Time.now + 1.5).to_i, 0].max
     else
       return nil
     end
   end
 
   def pop_before(t)
-    idx = @elements.bsearch_index { |e| e.expiration > t } || @elements.length
+    idx = @elements.bsearch_index { |e| e.expiration >= t } || @elements.length
     return @elements.slice!(0, idx)
   end
 end
 
 class FileTree
-  attr_accessor :timeout, :file, :expiration
+  attr_accessor :timeout
+  attr_reader :expiration
 
-  def initialize(timeout)
-    @timeout = timeout
+  def initialize(config, tree)
+    # FIXME: Load/create configuration file. Update config file on
+    # timeout update as well.
+
+    @timeout = config.default_timeout
+    @tree_path = File.join(config.root_path, tree)
   end
 
   def commit!
-    if !file.nil?
+    if !@file.nil?
       @file.close()
       @file = nil
     end
 
     @expiration = nil
   end
+
+  def grab_file(timeoutq, &block)
+    now = Time.now
+
+    if @file.nil?
+      dir = File.join(@tree_path, now.year.to_s, now.month.to_s)
+      FileUtils.mkdir_p(dir)
+      path = File.join(dir, now.iso8601.gsub(/:/, "") + ".txt")
+      @file = File::open(path, "a+")
+    end
+
+    block.call(@file)
+
+    if @timeout == 0
+      commit!
+    else
+      @expiration = now + @timeout
+      timeoutq << self
+    end
+  end
+end
+
+class MaulConfig
+  attr_reader :fifo_path, :root_path, :default_timeout
+
+  def initialize
+    # Set defaults.
+    @fifo_path = "/tmp/maul.fifo"
+    @root_path = "/tmp/maul"
+    @default_timeout = 900          # 15 minutes
+
+    # FIXME: Read config file!
+    # First check for a user configuration file in ~/.maulrc.
+    # If that doesn't exist, check for a system config file in
+    # /etc/maulrc.
+  end
+end
+
+class MaulFifo
+  def initialize(path)
+    @fifo_path = path
+    @fifo = nil
+
+    if !File::exists?(@fifo_path)
+      # XXX: Should this check for errors or just fail?
+      File::mkfifo(@fifo_path)
+    end
+
+    # FIXME: Is this atexit call really the best?
+    at_exit do
+      STDERR.puts "Terminating..."
+      File::unlink(@fifo_path)
+    end
+  end
+
+  def reserve
+    if @fifo.nil?
+      @fifo = File::open(@fifo_path, File::RDONLY | File::NONBLOCK)
+    end
+
+    return @fifo
+  end
+
+  def release
+    @fifo.close
+    @fifo = nil
+  end
 end
 
 def main
-  # FIXME: Read config file!
-  fifo_path = "/tmp/foo"
-  root_path = "/tmp/maul-tree"
-  default_timeout = 5
-
-  if !File::exists?(fifo_path)
-    # FIXME: Check for errors!
-    File::mkfifo(fifo_path)
-  end
-
-  at_exit do
-    STDERR.puts "Terminating..."
-    File::unlink(fifo_path)
-  end
-
+  config = MaulConfig.new
   timeoutq = TimeoutPrioQueue.new
-  leave = false
-  fifo = nil
+  fifo = MaulFifo.new config.fifo_path
+
   trees = {}
+  trees.default_proc = proc { |d, k| d[k] = FileTree.new(config, k) }
 
+  leave = false
   while !leave do
-    if fifo.nil?
-      fifo = File::open(fifo_path, File::RDONLY | File::NONBLOCK)
-    end
-
     timeout = timeoutq.seconds_to_next
     STDERR.puts "Going with timeout of %s" % [timeout || "INFINITE"]
-    rs, = File::select([fifo], nil, nil, timeout)
+    rs, = File::select([fifo.reserve], nil, nil, timeout)
 
     if rs == nil
       for elem in timeoutq.pop_before Time.now do
-        if elem.expiration <= elem.ft.expiration
+        if elem.needs_commit?
           elem.ft.commit!
-          STDERR.puts "COMMITED FILE: %s" % [elem.ft]
+          STDERR.puts "COMMITED FILE ON TIMEOUT: %s" % [elem.ft]
         end
       end
     else
-      leave = false
       rs[0].readlines.each do |line|
         split_line = line.split(':', 3)
         if split_line.length != 3
@@ -111,50 +171,21 @@ def main
         when "quit"
           leave = true
         when "commit"
-          ft = trees[tree]
-          if !ft.nil?
-            ft.commit!
-          end
+          trees[tree].commit!
+          STDERR.puts "COMMITED FILE ON COMMAND!"
         when "timeout"
-          # FIXME: Create tree here as well, and sync timeout to config
-          # file. Currently it is necessary to have logged first to
-          # update timeout, which is broken.
-
           # XXX: Resetting timeout does not affect existing expiration.
-          ft = trees[tree]
-          if !ft.nil?
-            ft.timeout = payload.to_i
-          end
+          trees[tree].timeout = payload.to_i
         when "log"
-          if trees[tree].nil?
-            trees[tree] = FileTree.new default_timeout
-          end
-
-          ft = trees[tree]
-          now = Time.now
-
-          if ft.file.nil?
-            dir = File.join(root_path, tree, now.year.to_s, now.month.to_s)
-            FileUtils.mkdir_p(dir)
-            path = File.join(dir, now.iso8601.gsub(/:/, "") + ".txt")
-            ft.file = File::open(path, "a+")
-          end
-
           payload = payload.gsub(/\\n/, "\n")
-          ft.file.write payload
-          ft.file.flush
-
-          if ft.timeout == 0
-            ft.commit!
-          else
-            ft.expiration = now + ft.timeout
-            timeoutq << ft
+          trees[tree].grab_file(timeoutq) do |ft_file|
+            ft_file.write payload
+            ft_file.flush
           end
         end
       end
 
-      fifo.close()
-      fifo = nil
+      fifo.release
     end
   end
 end
