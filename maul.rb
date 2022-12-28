@@ -3,9 +3,7 @@
 require 'fileutils'
 require 'socket'
 require 'time'
-
-# TODO: Remove unnecessary logging.
-# Actually load and sync to configs using YAML.
+require 'yaml'
 
 class TimeoutPrioQueue
   class Elem
@@ -49,15 +47,12 @@ class TimeoutPrioQueue
 end
 
 class FileTree
-  attr_accessor :timeout
   attr_reader :expiration
 
   def initialize(config, tree)
-    # FIXME: Load/create configuration file. Update config file on
-    # timeout update as well.
-
-    @timeout = config.default_timeout
+    @default_timeout = config.default_timeout
     @tree_path = File.join(config.root_path, tree)
+    @config_path = File.join(@tree_path, ".config.yaml")
   end
 
   def commit!
@@ -81,11 +76,37 @@ class FileTree
 
     block.call(@file)
 
-    if @timeout == 0
+    t = timeout
+    if t == 0
       commit!
     else
-      @expiration = now + @timeout
+      @expiration = now + t
       timeoutq << self
+    end
+  end
+
+  def timeout
+    # XXX: This would probably perform better with some sort of
+    # intelligent caching, but this level of performance should be
+    # sufficient for most applications.
+    begin
+      config_text = File.read(@config_path)
+      config = YAML.load(config_text)
+    rescue Errno::ENOENT
+      config = {}
+    end
+
+    config.default = {}
+
+    return (config["maul"]["timeout"] || @default_timeout).to_i
+  end
+
+  def timeout=(t)
+    # XXX: Again, caching would definitely speed this up, but in
+    # practice it probably isn't an issue.
+    FileUtils.mkdir_p(@tree_path)
+    File.open(@config_path, "w") do |f|
+      f.write YAML.dump({"maul" => {"timeout" => t}})
     end
   end
 end
@@ -94,15 +115,43 @@ class MaulConfig
   attr_reader :fifo_path, :root_path, :default_timeout
 
   def initialize
-    # Set defaults.
+    # Set defaults. Timeout is in seconds.
     @fifo_path = "/tmp/maul.fifo"
     @root_path = "/tmp/maul"
-    @default_timeout = 900          # 15 minutes
+    @default_timeout = 900
 
-    # FIXME: Read config file!
-    # First check for a user configuration file in ~/.maulrc.
-    # If that doesn't exist, check for a system config file in
-    # /etc/maulrc.
+    # Load configuration from user and system files.
+    load_config File.join("/", "etc", "maul", "config.yaml")
+    load_config File.join(Dir.home, ".config", "maul", "config.yaml")
+
+    # Ensure types are correct.
+    @fifo_path = @fifo_path.to_s
+    @root_path = @root_path.to_s
+    @default_timeout = @default_timeout.to_i
+  end
+
+  private
+
+  def load_config(path)
+    begin
+      config_text = File.read(path)
+    rescue Errno::ENOENT
+      return false
+    end
+
+    config = YAML.load(config_text)
+    config.default = {}
+
+    load_config_for = -> (name) do
+      c = config["maul"][name]
+      if !c.nil?
+        self.instance_variable_set("@" + name, c)
+      end
+    end
+
+    load_config_for.call "fifo_path"
+    load_config_for.call "root_path"
+    load_config_for.call "default_timeout"
   end
 end
 
@@ -112,13 +161,13 @@ class MaulFifo
     @fifo = nil
 
     if !File::exists?(@fifo_path)
-      # XXX: Should this check for errors or just fail?
+      # XXX: This will fail with an exception if for some reason the
+      # file cannot be created at the desired path.
       File::mkfifo(@fifo_path)
     end
 
-    # FIXME: Is this atexit call really the best?
     at_exit do
-      STDERR.puts "Terminating..."
+      release
       File::unlink(@fifo_path)
     end
   end
@@ -132,8 +181,10 @@ class MaulFifo
   end
 
   def release
-    @fifo.close
-    @fifo = nil
+    if !@fifo.nil?
+      @fifo.close
+      @fifo = nil
+    end
   end
 end
 
@@ -145,17 +196,14 @@ def main
   trees = {}
   trees.default_proc = proc { |d, k| d[k] = FileTree.new(config, k) }
 
-  leave = false
-  while !leave do
+  loop do
     timeout = timeoutq.seconds_to_next
-    STDERR.puts "Going with timeout of %s" % [timeout || "INFINITE"]
     rs, = File::select([fifo.reserve], nil, nil, timeout)
 
     if rs == nil
       for elem in timeoutq.pop_before Time.now do
         if elem.needs_commit?
           elem.ft.commit!
-          STDERR.puts "COMMITED FILE ON TIMEOUT: %s" % [elem.ft]
         end
       end
     else
@@ -169,17 +217,16 @@ def main
 
         case command
         when "quit"
-          leave = true
+          return 0
         when "commit"
           trees[tree].commit!
-          STDERR.puts "COMMITED FILE ON COMMAND!"
         when "timeout"
-          # XXX: Resetting timeout does not affect existing expiration.
+          # XXX: Resetting timeout does not affect existing expiration
+          # times.
           trees[tree].timeout = payload.to_i
         when "log"
-          payload = payload.gsub(/\\n/, "\n")
           trees[tree].grab_file(timeoutq) do |ft_file|
-            ft_file.write payload
+            ft_file.write payload.gsub(/\\n/, "\n")
             ft_file.flush
           end
         end
@@ -191,5 +238,5 @@ def main
 end
 
 if __FILE__ == $0
-  main()
+  exit main()
 end
