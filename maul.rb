@@ -15,7 +15,7 @@ class TimeoutPrioQueue
     end
 
     def needs_commit?
-      return !@ft.expiration.nil? && @ft.expiration <= @expiration
+      !@ft.expiration.nil? && @ft.expiration <= @expiration
     end
   end
 
@@ -34,15 +34,15 @@ class TimeoutPrioQueue
     if @elements.length > 0
       # XXX: Add an extra second to avoid repeated 0 second timeouts
       # when close to expiration.
-      return [(@elements[0].expiration - Time.now + 1.5).to_i, 0].max
+      [(@elements[0].expiration - Time.now + 1.5).to_i, 0].max
     else
-      return nil
+      nil
     end
   end
 
   def pop_before(t)
     idx = @elements.bsearch_index { |e| e.expiration >= t } || @elements.length
-    return @elements.slice!(0, idx)
+    @elements.slice!(0, idx)
   end
 end
 
@@ -74,7 +74,7 @@ class FileTree
       @file = File::open(path, "a+")
     end
 
-    block.call(@file)
+    block.call @file
 
     t = timeout
     if t == 0
@@ -98,7 +98,7 @@ class FileTree
 
     config.default = {}
 
-    return (config["maul"]["timeout"] || @default_timeout).to_i
+    (config["maul"]["timeout"] || @default_timeout).to_i
   end
 
   def timeout=(t)
@@ -177,7 +177,7 @@ class MaulFifo
       @fifo = File::open(@fifo_path, File::RDONLY | File::NONBLOCK)
     end
 
-    return @fifo
+    @fifo
   end
 
   def release
@@ -238,5 +238,5 @@ def main
 end
 
 if __FILE__ == $0
-  exit main()
+  exit main
 end
