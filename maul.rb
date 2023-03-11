@@ -95,7 +95,7 @@ class FileTree
     now = Time.now
 
     if @file.nil?
-      dir = File.join(@tree_path, now.year.to_s, now.month.to_s)
+      dir = File.join(@tree_path, now.year.to_s, '%02d' % now.month)
       FileUtils.mkdir_p(dir)
       path = File.join(dir, now.iso8601.gsub(/:/, "") + ".txt")
       @file = File::open(path, "a+")
